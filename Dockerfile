@@ -22,13 +22,15 @@ RUN chmod +x /app/entrypoint.sh /app/healthcheck.sh
 # Install Python deps
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Create directories
+# Create directories with permissions
 RUN mkdir -p /var/log/nginx /var/log/ffmpeg /var/www/html /var/run /etc/nginx && \
-    chmod 777 /var/www/html /tmp && \
-    touch /var/www/html/master.m3u8 && \
+    chmod 777 /var/www/html /tmp /var/run /var/log/nginx && \
+    echo "#EXTM3U" > /var/www/html/master.m3u8 && \
     chmod 644 /var/www/html/master.m3u8
 
 ENV PYTHONUNBUFFERED=1 PORT=8080 NGINX_RTMP_PORT=1935
 EXPOSE 8080 1935
 
-ENTRYPOINT ["/app/entrypoint.sh"]
+# Debug mode - comment this out to see what's happening
+CMD ["/app/entrypoint.sh"]
+ENTRYPOINT []
