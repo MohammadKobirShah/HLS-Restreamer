@@ -1,32 +1,28 @@
 version: "3.8"
 
 services:
-  server:
+  restream:
     build: .
-    container_name: hls-restreamer
-    restart: unless-stopped
     ports:
-      - "3000:3000"
-    volumes:
-      - hls_data:/tmp/hls
-      - ./logs:/app/logs
-      - ./channels.json:/app/channels.json
-      - ./config.json:/app/config.json
+      - "8080:8080"
+      - "1935:1935"
     environment:
-      - NODE_ENV=production
-    command: ["node", "server.js"]
-
-  cleanup:
-    build: .
-    container_name: hls-cleanup
-    restart: unless-stopped
+      - SOURCE_URL=https://your-playlist.m3u
+      - PORT=8080
+      - NGINX_RTMP_PORT=1935
+      - HLS_FRAGMENT=10
+      - HLS_PLIST_LENGTH=15
+      - MAX_CONCURRENT=100
+      - CHANNEL_REFRESH=60
     volumes:
-      - hls_data:/tmp/hls
-      - ./logs:/app/logs
-      - ./config.json:/app/config.json
-    depends_on:
-      - server
-    command: ["python3", "cleanup.py"]
+      - ./logs:/var/log
+      - hls-data:/tmp/hls
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/app/scripts/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
-  hls_data:
+  hls-data:
