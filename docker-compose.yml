@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  server:
+    build: .
+    container_name: hls-restreamer
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - hls_data:/tmp/hls
+      - ./logs:/app/logs
+      - ./channels.json:/app/channels.json
+      - ./config.json:/app/config.json
+    environment:
+      - NODE_ENV=production
+    command: ["node", "server.js"]
+
+  cleanup:
+    build: .
+    container_name: hls-cleanup
+    restart: unless-stopped
+    volumes:
+      - hls_data:/tmp/hls
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json
+    depends_on:
+      - server
+    command: ["python3", "cleanup.py"]
+
+volumes:
+  hls_data:
