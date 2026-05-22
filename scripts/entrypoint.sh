@@ -7,7 +7,7 @@ echo "=== RESTREAM-HLS ==="
 mkdir -p /tmp/hls /var/log/nginx /var/log/ffmpeg /var/www/html /var/run /etc/nginx
 chmod 777 /tmp/hls /var/www/html /var/run /var/log/nginx
 
-# Create master playlist
+# Create default master playlist
 cat > /var/www/html/master.m3u8 <<'EOF'
 #EXTM3U
 #EXT-X-VERSION:3
@@ -26,19 +26,35 @@ sleep 1
 # Test config
 nginx -t -c /etc/nginx/nginx.conf || exit 1
 
-# Start nginx in background
+# Start nginx
+echo "Starting nginx..."
 nginx -c /etc/nginx/nginx.conf &
 sleep 3
 
 # Verify nginx
-if pgrep nginx > /dev/null; then
-    echo "nginx started"
-    curl -sf http://localhost:8080/health && echo " - Health OK"
-else
-    echo "nginx failed"
+if ! pgrep nginx > /dev/null; then
+    echo "ERROR: nginx failed"
     cat /var/log/nginx/error.log
     exit 1
 fi
 
-# Start Python
+echo "nginx started"
+
+# Wait a moment then verify endpoints
+sleep 2
+
+echo ""
+echo "=== Testing Endpoints ==="
+echo -n "/health: "
+curl -sf http://localhost:8080/health && echo " OK" || echo " FAILED"
+
+echo -n "/master.m3u8: "
+curl -sf http://localhost:8080/master.m3u8 | head -2 && echo " OK" || echo " FAILED"
+
+echo ""
+echo "/tmp/hls directory:"
+ls -la /tmp/hls/ 2>/dev/null || echo "  (empty or not created yet)"
+
+echo ""
+echo "=== Starting Python App ==="
 exec python3 -m src.restream
