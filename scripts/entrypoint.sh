@@ -1,31 +1,19 @@
 #!/bin/bash
 set -e
 
-echo "=== Starting ==="
+echo "=== RESTREAM-HLS ==="
 mkdir -p /tmp/hls /var/log/nginx /var/log/ffmpeg /var/www/html /var/run
-chmod 777 /tmp/hls
+chmod 777 /tmp/hls /var/www/html
 
-# Copy nginx config if missing
-[ ! -f /etc/nginx/nginx.conf ] && cp /app/config/nginx.conf /etc/nginx/nginx.conf
-
-# Test nginx config
-nginx -c /etc/nginx/nginx.conf -t
+# Copy nginx config
+cp /app/config/nginx.conf /etc/nginx/nginx.conf
 
 # Start nginx
 nginx -c /etc/nginx/nginx.conf &
 sleep 3
 
-# Verify nginx is running
-if ! pgrep nginx > /dev/null; then
-    echo "ERROR: nginx failed"
-    cat /var/log/nginx/error.log
-    exit 1
-fi
+# Health check
+curl -sf http://localhost:${PORT:-8080}/health && echo " - Health OK" || echo " - Health check failed"
 
-echo "nginx running"
-
-# Test health endpoint
-curl -sf http://localhost:${PORT:-8080}/health && echo " - Health OK"
-
-# Start Python app
+# Start Python
 exec python3 -m src.restream
