@@ -1,35 +1,35 @@
 # ============================================
 # Stage 1: Builder
 # ============================================
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (FIXED for Debian Trixie)
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
-    libpcre3 \
-    libpcre3-dev \
+    libpcre2-dev \
     zlib1g-dev \
     libssl-dev \
     pkg-config \
     wget \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Build nginx with RTMP module
-RUN git clone https://github.com/sergey-dryabzhinsky/nginx-rtmp-module.git /tmp/nginx-rtmp \
-    && wget -qO- http://nginx.org/download/nginx-1.24.0.tar.gz | tar -xz -C /tmp \
-    && cd /tmp/nginx-1.24.0 \
-    && ./configure \
+RUN git clone https://github.com/sergey-dryabzhinsky/nginx-rtmp-module.git /tmp/nginx-rtmp && \
+    wget -qO- http://nginx.org/download/nginx-1.24.0.tar.gz | tar -xz -C /tmp && \
+    cd /tmp/nginx-1.24.0 && \
+    ./configure \
         --add-module=/tmp/nginx-rtmp \
         --with-http_ssl_module \
         --with-http_gzip_static \
         --with-stream \
-        --with-stream_ssl_module \
-    && make -j$(nproc) \
-    && make install \
-    && rm -rf /tmp/nginx-* /tmp/nginx-rtmp
+        --with-stream_ssl_module && \
+    make -j$(nproc) && \
+    make install && \
+    rm -rf /tmp/nginx-* /tmp/nginx-rtmp
 
 # ============================================
 # Stage 2: Runtime
@@ -45,7 +45,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     procps \
     tzdata \
-    # For tmpfs simulation on Railway (RAM disk)
     && rm -rf /var/lib/apt/lists/* \
     && useradd -m -u 1000 -s /bin/bash app
 
@@ -53,7 +52,6 @@ WORKDIR /app
 
 # Copy nginx binary from builder
 COPY --from=builder /usr/local/nginx /usr/local/nginx
-COPY --from=builder /usr/local/nginx/sbin/nginx /usr/local/nginx/sbin/nginx
 
 # Copy application files
 COPY requirements.txt .
