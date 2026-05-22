@@ -1,3 +1,7 @@
+# ============================================================
+# Kobir Shah Multi-Channel HLS Restreamer – Docker Edition
+# ============================================================
+
 FROM debian:bookworm-slim
 
 # Install required packages
@@ -14,15 +18,15 @@ RUN apt-get update && apt-get install -y \
 # Create working directories
 RUN mkdir -p /root/hls /root/logs /root/nginx
 
-# Copy configuration and script
-COPY nginx.conf /root/nginx.conf
-COPY start.sh /start.sh
+# Copy configuration and the startup script
+COPY nginx.conf  /root/nginx.conf
+COPY start.sh    /start.sh
 RUN chmod +x /start.sh
 
-# Expose HLS port
+# Inform Docker that the container listens on port 8080
 EXPOSE 8080
 
-# Run as root (nginx can write its pid and access /root)
+# Run as root (nginx needs to write its pid and access /root)
 USER root
 WORKDIR /root
 
