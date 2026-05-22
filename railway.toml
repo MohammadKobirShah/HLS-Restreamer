@@ -4,13 +4,14 @@ builder = "docker"
 
 [deploy]
 healthcheckPath = "/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-
-[variableGroups]
-production = ["SOURCE_URL", "RTMP_PORT"]
 
 [environment]
 PORT = "8080"
 NGINX_RTMP_PORT = "1935"
+HLS_FRAGMENT = "10"
+HLS_PLIST_LENGTH = "15"
+MAX_CONCURRENT = "50"
+CHANNEL_REFRESH = "60"
