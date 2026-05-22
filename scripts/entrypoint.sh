@@ -2,10 +2,8 @@
 set -e
 
 echo "=== RESTREAM-HLS ==="
-echo "Source: ${SOURCE_URL:-not set}"
-echo "PORT: ${PORT:-8080}"
 
-# Create ALL directories
+# Create ALL directories FIRST
 mkdir -p /tmp/hls /var/log/nginx /var/log/ffmpeg /var/www/html /var/run /etc/nginx
 chmod 777 /tmp/hls /var/www/html /var/run /var/log/nginx
 
@@ -22,53 +20,56 @@ chmod 644 /var/www/html/master.m3u8
 # Copy nginx config
 cp /app/config/nginx.conf /etc/nginx/nginx.conf
 
+# Kill any existing nginx
+pkill nginx 2>/dev/null || true
+sleep 2
+
 # Test config
 echo "Testing nginx config..."
-nginx -t -c /etc/nginx/nginx.conf 2>&1 || {
-    echo "Config test failed!"
-    cat /etc/nginx/nginx.conf
+nginx -t -c /etc/nginx/nginx.conf
+
+# Start nginx with error logging
+echo "Starting nginx..."
+nginx -c /etc/nginx/nginx.conf 2>&1 || {
+    echo "nginx start failed!"
+    cat /var/log/nginx/error.log 2>/dev/null || true
     exit 1
 }
 
-# Kill old nginx
-pkill nginx 2>/dev/null || true
-sleep 1
+# WAIT for nginx to be fully ready
+echo "Waiting for nginx..."
+for i in {1..10}; do
+    sleep 1
+    if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+        echo "nginx ready!"
+        break
+    fi
+    echo "  waiting... ($i)"
+done
 
-# Start nginx
-echo "Starting nginx..."
-nginx -c /etc/nginx/nginx.conf
-NGINX_PID=$!
-sleep 3
-
-# Verify nginx
-if ! kill -0 $NGINX_PID 2>/dev/null; then
-    echo "ERROR: nginx failed to start"
-    cat /var/log/nginx/error.log 2>/dev/null || true
-    exit 1
-fi
-
-echo "nginx started (PID: $NGINX_PID)"
-
-# Test all endpoints
+# Final verification
 echo ""
-echo "Testing endpoints..."
+echo "Verifying endpoints..."
 
 # Test /health
-echo -n "/health: "
-curl -sf --max-time 5 http://localhost:${PORT:-8080}/health && echo " ✓" || echo " ✗"
+HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+echo "  /health: $HEALTH_STATUS"
 
-# Test /master.m3u8
-echo -n "/master.m3u8: "
-curl -sf --max-time 5 -A "Mozilla/5.0" http://localhost:${PORT:-8080}/master.m3u8 | head -3 && echo " ✓" || echo " ✗"
-
-# Test /
-echo -n "/: "
-curl -sf --max-time 5 http://localhost:${PORT:-8080}/ && echo " ✓" || echo " ✗"
+# Test master.m3u8
+MASTER_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/master.m3u8)
+echo "  /master.m3u8: $MASTER_STATUS"
 
 # Show nginx processes
 echo ""
-echo "Nginx processes:"
-pgrep -a nginx || echo "No nginx found"
+echo "Nginx status:"
+pgrep -a nginx || echo "nginx not running!"
+
+# Check error log
+if [ -f /var/log/nginx/error.log ]; then
+    echo ""
+    echo "Recent nginx errors:"
+    tail -5 /var/log/nginx/error.log
+fi
 
 echo ""
 echo "=== Starting Python App ==="
