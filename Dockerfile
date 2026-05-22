@@ -1,11 +1,6 @@
-# ============================================
-# Stage 1: Builder
-# ============================================
-FROM python:3.11-slim AS builder
+FROM python:3.11-slim
 
-WORKDIR /app
-
-# Install build dependencies (FIXED for Debian Trixie)
+# Install dependencies and create user
 RUN apt-get update && apt-get install -y \
     build-essential \
     git \
@@ -15,79 +10,43 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     wget \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Build nginx with RTMP module
-RUN git clone https://github.com/sergey-dryabzhinsky/nginx-rtmp-module.git /tmp/nginx-rtmp && \
-    wget -qO- http://nginx.org/download/nginx-1.24.0.tar.gz | tar -xz -C /tmp && \
-    cd /tmp/nginx-1.24.0 && \
-    ./configure \
-        --add-module=/tmp/nginx-rtmp \
-        --with-http_ssl_module \
-        --with-http_gzip_static \
-        --with-stream \
-        --with-stream_ssl_module && \
-    make -j$(nproc) && \
-    make install && \
-    rm -rf /tmp/nginx-* /tmp/nginx-rtmp
-
-# ============================================
-# Stage 2: Runtime
-# ============================================
-FROM python:3.11-slim
-
-LABEL maintainer="restream-hls"
-LABEL description="Low-latency HLS restreamer without transcoding"
-
-# Install runtime deps
-RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     procps \
     tzdata \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 -s /bin/bash app
+    && useradd -m -u 1000 -s /bin/bash app \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy nginx binary from builder
-COPY --from=builder /usr/local/nginx /usr/local/nginx
+# Build nginx with RTMP module
+COPY build-nginx.sh /tmp/build-nginx.sh
+RUN chmod +x /tmp/build-nginx.sh && /tmp/build-nginx.sh
 
 # Copy application files
-COPY requirements.txt .
+COPY requirements.txt ./
 COPY src/ ./src/
 COPY config/ ./config/
 COPY scripts/ ./scripts/
 
-# Create directories
-RUN mkdir -p /var/log/nginx \
-             /var/log/ffmpeg \
-             /tmp/hls \
-             /var/www/html
-
-# Set permissions
-RUN chown -R app:app /app /var/log /tmp/hls /var/www/html
-
-# Python dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Environment defaults
+# Create directories and set proper permissions
+RUN mkdir -p /var/log/nginx /var/log/ffmpeg /tmp/hls /var/www/html && \
+    chown -R app:app /app /var/log/nginx /var/log/ffmpeg /tmp/hls /var/www/html && \
+    chmod +x /app/scripts/entrypoint.sh
+
+# Environment variables
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
-    NGINX_RTMP_PORT=1935 \
-    HLS_FRAGMENT=10 \
-    HLS_PLIST_LENGTH=15 \
-    LOG_LEVEL=INFO \
-    CHANNEL_REFRESH=60
+    NGINX_RTMP_PORT=1935
 
 # Expose ports
 EXPOSE 8080 1935
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD /app/scripts/healthcheck.sh
-
+# Switch to non-root user
 USER app
 
+# Start application
 ENTRYPOINT ["/app/scripts/entrypoint.sh"]
