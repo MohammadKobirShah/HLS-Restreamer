@@ -17,15 +17,13 @@ COPY requirements.txt ./
 COPY src/ ./src/
 COPY config/ ./config/
 
-# Copy scripts and set permissions
 COPY scripts/entrypoint.sh /tmp/entrypoint.sh
 COPY scripts/healthcheck.sh /tmp/healthcheck.sh
-
 RUN chmod +x /tmp/entrypoint.sh /tmp/healthcheck.sh && \
     mv /tmp/entrypoint.sh /app/entrypoint.sh && \
     mv /tmp/healthcheck.sh /app/healthcheck.sh
 
-# Install Python deps
+# Install Python deps (NO uvloop - use standard asyncio)
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Create directories
