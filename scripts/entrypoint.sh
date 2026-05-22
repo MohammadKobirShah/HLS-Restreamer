@@ -24,5 +24,8 @@ fi
 
 echo "nginx running"
 
+# Test health endpoint
+curl -sf http://localhost:${PORT:-8080}/health && echo " - Health OK"
+
 # Start Python app
 exec python3 -m src.restream
