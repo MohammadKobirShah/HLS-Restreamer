@@ -1,36 +1,29 @@
-FROM python:3.11-slim
+FROM debian:bookworm-slim
 
+# Install required packages
 RUN apt-get update && apt-get install -y \
-    build-essential git wget libpcre2-dev zlib1g-dev libssl-dev pkg-config ca-certificates \
-    ffmpeg curl procps tzdata \
+    nginx \
+    ffmpeg \
+    procps \
+    net-tools \
+    curl \
+    ca-certificates \
+    bash \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Create working directories
+RUN mkdir -p /root/hls /root/logs /root/nginx
 
-# Build nginx with RTMP
-COPY build-nginx.sh /tmp/build-nginx.sh
-RUN chmod +x /tmp/build-nginx.sh && /tmp/build-nginx.sh
+# Copy configuration and script
+COPY nginx.conf /root/nginx.conf
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
 
-# Copy files
-COPY requirements.txt ./
-COPY src/ ./src/
-COPY config/ ./config/
-COPY scripts/entrypoint.sh /app/entrypoint.sh
-COPY scripts/healthcheck.sh /app/healthcheck.sh
-RUN chmod +x /app/entrypoint.sh /app/healthcheck.sh
+# Expose HLS port
+EXPOSE 8080
 
-# Install Python deps
-RUN pip install --no-cache-dir -r requirements.txt
+# Run as root (nginx can write its pid and access /root)
+USER root
+WORKDIR /root
 
-# Create directories with permissions
-RUN mkdir -p /var/log/nginx /var/log/ffmpeg /var/www/html /var/run /etc/nginx && \
-    chmod 777 /var/www/html /tmp /var/run /var/log/nginx && \
-    echo "#EXTM3U" > /var/www/html/master.m3u8 && \
-    chmod 644 /var/www/html/master.m3u8
-
-ENV PYTHONUNBUFFERED=1 PORT=8080 NGINX_RTMP_PORT=1935
-EXPOSE 8080 1935
-
-# Debug mode - comment this out to see what's happening
-CMD ["/app/entrypoint.sh"]
-ENTRYPOINT []
+CMD ["/bin/bash", "/start.sh"]
