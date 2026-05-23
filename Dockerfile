@@ -1,33 +1,38 @@
 # ============================================================
-# Kobir Shah Multi-Channel HLS Restreamer – Docker Edition
+# Kobir Shah Multi-Channel HLS Restreamer – Optimized Edition
 # ============================================================
-
 FROM debian:bookworm-slim
 
-# Install required packages
-RUN apt-get update && apt-get install -y \
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install required packages with cleanup
+RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx \
     ffmpeg \
     procps \
-    net-tools \
+    iproute2 \
     curl \
     ca-certificates \
     bash \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Create working directories
-RUN mkdir -p /root/hls /root/logs /root/nginx
+# Create working directories with proper permissions
+RUN mkdir -p /root/hls /root/logs /root/nginx && \
+    chmod 755 /root
 
-# Copy configuration and the startup script
+# Copy configuration files
 COPY nginx.conf  /root/nginx.conf
 COPY start.sh    /start.sh
 RUN chmod +x /start.sh
 
-# Inform Docker that the container listens on port 8080
+# Expose HTTP port
 EXPOSE 8080
 
-# Run as root (nginx needs to write its pid and access /root)
-USER root
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
 WORKDIR /root
 
 CMD ["/bin/bash", "/start.sh"]
