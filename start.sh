@@ -1,15 +1,18 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# Multi-channel HLS restreamer (Docker Edition) – with M3U URL import
+# Multi-channel HLS restreamer – Production-Ready Edition
 # Developer: Kobir Shah
-# All files stay under /root
+# Optimized for: Low latency, minimal buffering, maximum stability
 #
 
 set -euo pipefail
+IFS=$'\n\t'
 
-# ---------- Configuration ----------
+# ========================================
+# Configuration
+# ========================================
 PLAYLIST_FILE="/root/playlist.m3u"
-M3U_URL="${M3U_URL:-}"                      # optional remote playlist URL
+M3U_URL="${M3U_URL:-}"
 HLS_ROOT="/root/hls"
 NGINX_CONF="/root/nginx.conf"
 LOG_DIR="/root/logs"
@@ -17,53 +20,100 @@ MASTER_PLAYLIST="${HLS_ROOT}/master.m3u8"
 OUTPUT_PLAYLIST="/root/restream_playlist.m3u8"
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
 RESTART_THRESHOLD=15
+MAX_RETRIES=3
 
 mkdir -p "$HLS_ROOT" "$LOG_DIR"
+chmod 755 /root "$HLS_ROOT" "$LOG_DIR"
 
-# ---------- Fetch remote playlist (if URL given) ----------
+# ========================================
+# Logging helpers
+# ========================================
+log_info()  { echo "[INFO]  $*" >&2; }
+log_warn()  { echo "[WARN]  $*" >&2; }
+log_error() { echo "[ERROR] $*" >&2; }
+
+# ========================================
+# Download remote playlist
+# ========================================
 if [[ -n "$M3U_URL" ]]; then
-    echo "Downloading playlist from $M3U_URL ..."
-    if curl -fsSL --connect-timeout 10 --max-time 30 "$M3U_URL" -o "$PLAYLIST_FILE"; then
-        echo "Playlist downloaded successfully."
-    else
-        echo "ERROR: Failed to download playlist from $M3U_URL" >&2
+    log_info "Downloading playlist from $M3U_URL"
+    for i in {1..3}; do
+        if curl -fsSL --connect-timeout 10 --max-time 30 \
+            -H "User-Agent: Mozilla/5.0" \
+            "$M3U_URL" -o "$PLAYLIST_FILE"; then
+            log_info "Playlist downloaded successfully"
+            break
+        else
+            log_warn "Download attempt $i failed"
+            sleep 2
+        fi
+    done
+    
+    if [[ ! -f "$PLAYLIST_FILE" ]]; then
+        log_error "Failed to download playlist after 3 attempts"
         exit 1
     fi
 fi
 
-# ---------- Pre-flight checks ----------
+# ========================================
+# Pre-flight checks
+# ========================================
 if [[ ! -f "$PLAYLIST_FILE" ]]; then
-    echo "ERROR: Playlist not found: $PLAYLIST_FILE" >&2
-    echo "Either mount a local file or set M3U_URL environment variable." >&2
-    exit 1
-fi
-if [[ ! -f "$NGINX_CONF" ]]; then
-    echo "ERROR: Nginx config not found: $NGINX_CONF" >&2
+    log_error "Playlist not found: $PLAYLIST_FILE"
+    log_error "Either mount a local file or set M3U_URL environment variable"
     exit 1
 fi
 
-# ---------- Cleanup ----------
+if [[ ! -f "$NGINX_CONF" ]]; then
+    log_error "Nginx config not found: $NGINX_CONF"
+    exit 1
+fi
+
+# ========================================
+# Cleanup existing processes
+# ========================================
+log_info "Cleaning up existing processes..."
 pkill -f "ffmpeg.*${HLS_ROOT}" 2>/dev/null || true
-pkill -x nginx                  2>/dev/null || true
+pkill -x nginx 2>/dev/null || true
 sleep 2
 
-chmod 755 /root
+# Remove stale pid files
+rm -f /root/nginx.pid /root/*.pid
 
-# ---------- Parse M3U playlist ----------
+# ========================================
+# Parse M3U playlist
+# ========================================
 declare -a DISPLAY_NAMES=()
 declare -a URLS=()
 declare -a FOLDER_NAMES=()
 declare -a EXTINF_LINES=()
 
-echo "Parsing $PLAYLIST_FILE..."
+log_info "Parsing $PLAYLIST_FILE"
+
 while IFS= read -r line; do
-    line=$(echo "$line" | tr -d '\r')
+    line=$(echo "$line" | tr -d '\r\n')
+    [[ -z "$line" ]] && continue
+    
     if [[ "$line" =~ ^#EXTINF: ]]; then
         extinf="$line"
-        display_name=$(echo "$line" | sed -n 's/.*,\(.*\)$/\1/p')
-        read -r url
-        url=$(echo "$url" | tr -d '\r')
-        foldername=$(echo "$display_name" | tr -d ' ' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+        display_name=$(echo "$line" | sed -n 's/.*,\s*\(.*\)$/\1/p' | xargs)
+        
+        # Read next non-empty line as URL
+        while IFS= read -r url; do
+            url=$(echo "$url" | tr -d '\r\n' | xargs)
+            [[ -n "$url" && ! "$url" =~ ^# ]] && break
+        done
+        
+        if [[ -z "$url" || "$url" =~ ^# ]]; then
+            log_warn "Skipping channel '$display_name' - no valid URL"
+            continue
+        fi
+        
+        # Generate safe folder name
+        foldername=$(echo "$display_name" | tr '[:upper:]' '[:lower:]' | \
+                     tr -cd 'a-z0-9' | cut -c1-30)
+        [[ -z "$foldername" ]] && foldername="channel"
+        
         DISPLAY_NAMES+=("$display_name")
         URLS+=("$url")
         FOLDER_NAMES+=("$foldername")
@@ -72,355 +122,396 @@ while IFS= read -r line; do
 done < "$PLAYLIST_FILE"
 
 if [ ${#DISPLAY_NAMES[@]} -eq 0 ]; then
-    echo "No channels found in $PLAYLIST_FILE." >&2
+    log_error "No valid channels found in $PLAYLIST_FILE"
     exit 1
 fi
 
-# Deduplicate / fix empty folder names
+log_info "Found ${#DISPLAY_NAMES[@]} channels"
+
+# ========================================
+# Deduplicate folder names
+# ========================================
 declare -A FOLDER_SEEN=()
-for i in "${!DISPLAY_NAMES[@]}"; do
+for i in "${!FOLDER_NAMES[@]}"; do
     folder="${FOLDER_NAMES[$i]}"
-    [[ -z "$folder" ]] && folder="channel_${i}"
+    original="$folder"
+    counter=1
+    
     while [[ -n "${FOLDER_SEEN[$folder]:-}" ]]; do
-        folder="${folder}_$((++FOLDER_SEEN[$folder]))"
+        folder="${original}${counter}"
+        ((counter++))
     done
+    
     FOLDER_SEEN[$folder]=1
     FOLDER_NAMES[$i]="$folder"
 done
 
-# ---------- Audio Language Probing ----------
+# ========================================
+# Audio track detection
+# ========================================
 declare -a MAP_ARGS=()
 declare -a CHOSEN_LANGS=()
 
 probe_audio_track() {
     local url="$1"
     local folder="$2"
+    
     local audio_info
-    audio_info=$(timeout 20 ffprobe -v error \
+    audio_info=$(timeout 15 ffprobe -v error \
         -select_streams a \
         -show_entries stream=index:stream_tags=language \
         -of csv=p=0 \
         -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-        -probesize 5000000 -analyzeduration 5000000 \
-        "$url" 2>"${LOG_DIR}/ffprobe_${folder}.log")
-
+        -analyzeduration 3000000 -probesize 3000000 \
+        "$url" 2>/dev/null) || true
+    
+    local chosen_idx=""
+    local chosen_lang="Auto"
     local beng_idx=""
     local hin_idx=""
     local first_idx=""
-    local first_lang="unknown"
-
+    
     if [[ -n "$audio_info" ]]; then
         while IFS=, read -r idx lang; do
             idx=$(echo "$idx" | xargs)
             lang=$(echo "$lang" | xargs | tr '[:upper:]' '[:lower:]')
-            if [[ -z "$first_idx" && -n "$idx" ]]; then
+            
+            [[ -z "$idx" ]] && continue
+            
+            if [[ -z "$first_idx" ]]; then
                 first_idx="$idx"
-                first_lang="$lang"
             fi
-            if [[ "$lang" == "ben" || "$lang" == "beng" || "$lang" == "bengali" ]]; then
+            
+            if [[ "$lang" =~ ^(ben|beng|bengali)$ ]]; then
                 beng_idx="$idx"
-            fi
-            if [[ "$lang" == "hin" || "$lang" == "hindi" ]]; then
+            elif [[ "$lang" =~ ^(hin|hindi)$ ]]; then
                 hin_idx="$idx"
             fi
         done <<< "$audio_info"
     fi
-
-    if [[ -z "$first_idx" ]]; then
-        echo "  [!] $folder: No audio tracks detected -- using auto-select" >&2
-        CHOSEN_LANGS+=("auto")
-        return
-    fi
-
-    local chosen_idx="$first_idx"
-    local chosen_lang="${first_lang^}"
-
+    
     if [[ -n "$beng_idx" ]]; then
         chosen_idx="$beng_idx"
         chosen_lang="Bengali"
-        echo "  [OK] $folder: Bengali audio found (stream $beng_idx)" >&2
+        log_info "  ✓ $folder: Bengali audio (stream $beng_idx)"
     elif [[ -n "$hin_idx" ]]; then
         chosen_idx="$hin_idx"
         chosen_lang="Hindi"
-        echo "  [~~] $folder: Bengali not found, using Hindi (stream $hin_idx)" >&2
+        log_info "  ~ $folder: Hindi audio (stream $hin_idx)"
+    elif [[ -n "$first_idx" ]]; then
+        chosen_idx="$first_idx"
+        chosen_lang="Default"
+        log_info "  - $folder: Default audio (stream $first_idx)"
     else
-        echo "  [--] $folder: No Bengali/Hindi -- using default ($chosen_lang, stream $first_idx)" >&2
+        chosen_lang="Auto"
+        log_warn "  ! $folder: No audio detected, using auto-select"
+        echo ""
+        return
     fi
-
-    CHOSEN_LANGS+=("$chosen_lang")
+    
     echo "-map 0:v:0 -map 0:$chosen_idx"
 }
 
-echo ""
-echo "Probing audio tracks (Priority: Bengali -> Hindi -> Default)..."
+log_info "Probing audio tracks (Bengali → Hindi → Default)..."
 for i in "${!DISPLAY_NAMES[@]}"; do
     url="${URLS[$i]}"
     folder="${FOLDER_NAMES[$i]}"
+    
     map_arg=$(probe_audio_track "$url" "$folder")
     MAP_ARGS+=("$map_arg")
+    
+    if [[ -n "$map_arg" ]]; then
+        if [[ "$map_arg" =~ Bengali ]]; then
+            CHOSEN_LANGS+=("Bengali")
+        elif [[ "$map_arg" =~ Hindi ]]; then
+            CHOSEN_LANGS+=("Hindi")
+        else
+            CHOSEN_LANGS+=("Default")
+        fi
+    else
+        CHOSEN_LANGS+=("Auto")
+    fi
 done
-echo ""
 
-# ---------- Helper: launch FFmpeg ----------
+# ========================================
+# FFmpeg starter (optimized for low latency)
+# ========================================
 start_ffmpeg() {
     local idx=$1
     local folder="${FOLDER_NAMES[$idx]}"
     local url="${URLS[$idx]}"
     local ch_dir="${HLS_ROOT}/${folder}"
+    
     mkdir -p "$ch_dir"
-    rm -f "${ch_dir}"/segment_*.ts "${ch_dir}"/*.m3u8
-
+    rm -f "${ch_dir}"/segment*.ts "${ch_dir}"/*.m3u8
+    
     local map_opts="${MAP_ARGS[$idx]:-}"
-
+    
+    # Optimized FFmpeg command for minimal buffering
+    local ffmpeg_cmd=(
+        ffmpeg -hide_banner -loglevel error -y
+        # Input options
+        -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 20
+        -timeout 10000000
+        -fflags +genpts+discardcorrupt+nobuffer
+        -flags low_delay
+        -analyzeduration 2000000 -probesize 2000000
+        -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        -i "$url"
+    )
+    
+    # Add audio mapping if available
     if [[ -n "$map_opts" ]]; then
-        nohup ffmpeg -y \
-            -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 30 \
-            -fflags +genpts+discardcorrupt \
-            -avoid_negative_ts make_zero \
-            -err_detect ignore_err \
-            -probesize 5000000 -analyzeduration 5000000 \
-            -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -i "$url" \
-            $map_opts \
-            -c copy \
-            -f hls \
-            -hls_time 4 \
-            -hls_list_size 6 \
-            -hls_flags delete_segments+append_list+independent_segments \
-            -hls_segment_filename "${ch_dir}/segment_%03d.ts" \
-            "${ch_dir}/${folder}.m3u8" \
-            >> "${LOG_DIR}/ffmpeg_${folder}.log" 2>&1 &
-    else
-        nohup ffmpeg -y \
-            -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 30 \
-            -fflags +genpts+discardcorrupt \
-            -avoid_negative_ts make_zero \
-            -err_detect ignore_err \
-            -probesize 5000000 -analyzeduration 5000000 \
-            -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -i "$url" \
-            -c copy \
-            -f hls \
-            -hls_time 4 \
-            -hls_list_size 6 \
-            -hls_flags delete_segments+append_list+independent_segments \
-            -hls_segment_filename "${ch_dir}/segment_%03d.ts" \
-            "${ch_dir}/${folder}.m3u8" \
-            >> "${LOG_DIR}/ffmpeg_${folder}.log" 2>&1 &
+        ffmpeg_cmd+=($map_opts)
     fi
+    
+    # Output options (optimized)
+    ffmpeg_cmd+=(
+        -c:v copy -c:a copy
+        -copyts -start_at_zero
+        -avoid_negative_ts make_zero
+        -max_muxing_queue_size 1024
+        # HLS options for low latency
+        -f hls
+        -hls_time 2
+        -hls_list_size 4
+        -hls_flags delete_segments+append_list+omit_endlist+independent_segments
+        -hls_segment_type mpegts
+        -hls_segment_filename "${ch_dir}/segment_%03d.ts"
+        -method PUT
+        "${ch_dir}/${folder}.m3u8"
+    )
+    
+    # Start FFmpeg in background
+    nohup "${ffmpeg_cmd[@]}" \
+        >> "${LOG_DIR}/ffmpeg_${folder}.log" 2>&1 &
+    
+    echo $! > "${ch_dir}/.ffmpeg.pid"
 }
 
-# ---------- Launch all FFmpegs ----------
-echo "Starting FFmpeg for ${#DISPLAY_NAMES[@]} channels..."
+# ========================================
+# Launch all channels
+# ========================================
+log_info "Starting FFmpeg for ${#DISPLAY_NAMES[@]} channels..."
 for i in "${!DISPLAY_NAMES[@]}"; do
     start_ffmpeg "$i"
+    sleep 0.5
 done
-sleep 8
 
-# Validate initial segments
-dead=()
+# Wait for initial segments
+log_info "Waiting for initial segments..."
+sleep 10
+
+# Validate channels
+dead_channels=()
 for i in "${!DISPLAY_NAMES[@]}"; do
     folder="${FOLDER_NAMES[$i]}"
-    if ! ls "${HLS_ROOT}/${folder}"/segment_*.ts &>/dev/null; then
-        dead+=("${DISPLAY_NAMES[$i]}")
+    if ! compgen -G "${HLS_ROOT}/${folder}/segment*.ts" > /dev/null; then
+        dead_channels+=("${DISPLAY_NAMES[$i]} ($folder)")
     fi
 done
-if (( ${#dead[@]} )); then
-    echo ""
-    echo "WARNING: No segments yet for: ${dead[*]}"
+
+if (( ${#dead_channels[@]} > 0 )); then
+    log_warn "Channels without segments (${#dead_channels[@]}):"
+    printf '%s\n' "${dead_channels[@]}" | head -5
+    [[ ${#dead_channels[@]} -gt 5 ]] && log_warn "... and $((${#dead_channels[@]} - 5)) more"
+fi
+
+# ========================================
+# Generate master playlist
+# ========================================
+log_info "Generating master playlist..."
+{
+    echo "#EXTM3U"
+    echo "#PLAYLIST:Kobir Shah Multi-Channel Stream"
     for i in "${!DISPLAY_NAMES[@]}"; do
         folder="${FOLDER_NAMES[$i]}"
-        if ! ls "${HLS_ROOT}/${folder}"/segment_*.ts &>/dev/null; then
-            echo "--- ${folder} (last 3 lines) ---"
-            tail -3 "${LOG_DIR}/ffmpeg_${folder}.log" 2>/dev/null || echo "(no log)"
-        fi
+        echo "${EXTINF_LINES[$i]}"
+        echo "http://localhost:8080/${folder}/${folder}.m3u8"
     done
-    echo ""
-fi
+} > "$MASTER_PLAYLIST"
 
-# ---------- Generate master playlist ----------
-echo "#EXTM3U" > "$MASTER_PLAYLIST"
-echo "#PLAYLIST: Kobir Shah Multi-Channel Stream" >> "$MASTER_PLAYLIST"
-for i in "${!DISPLAY_NAMES[@]}"; do
-    folder="${FOLDER_NAMES[$i]}"
-    echo "${EXTINF_LINES[$i]}" >> "$MASTER_PLAYLIST"
-    echo "http://localhost:8080/${folder}/${folder}.m3u8" >> "$MASTER_PLAYLIST"
-done
+# ========================================
+# Start Nginx
+# ========================================
+log_info "Starting Nginx..."
 
-# ---------- Start Nginx ----------
-cp -f "$NGINX_CONF" /root/nginx.conf.active
-if ! nginx -t -c /root/nginx.conf.active -p /root/ 2>>"${LOG_DIR}/nginx.log"; then
-    echo "ERROR: Nginx config validation failed!" >&2
-    cat "${LOG_DIR}/nginx.log" >&2
+if ! nginx -t -c "$NGINX_CONF" -p /root/ 2>>"${LOG_DIR}/nginx.log"; then
+    log_error "Nginx config validation failed!"
+    tail -20 "${LOG_DIR}/nginx.log"
     exit 1
 fi
 
-nohup nginx -c /root/nginx.conf.active -p /root/ >> "${LOG_DIR}/nginx.log" 2>&1 &
-sleep 2
+nginx -c "$NGINX_CONF" -p /root/ >> "${LOG_DIR}/nginx.log" 2>&1
 
-if ! pgrep -x nginx > /dev/null; then
-    echo "ERROR: Nginx failed to start!" >&2
-    tail -20 "${LOG_DIR}/nginx.log" >&2
-    tail -20 "${LOG_DIR}/nginx_error.log" >&2
-    exit 1
-fi
-
-RETRIES=0
-while ! ss -tlnp 2>/dev/null | grep -q ':8080' && ! netstat -tlnp 2>/dev/null | grep -q ':8080'; do
-    RETRIES=$((RETRIES + 1))
-    if (( RETRIES > 10 )); then
-        echo "ERROR: Nginx is not listening on port 8080!" >&2
-        tail -20 "${LOG_DIR}/nginx_error.log" >&2
-        exit 1
+# Wait for Nginx to start
+for i in {1..15}; do
+    if ss -tlnp 2>/dev/null | grep -q ':8080'; then
+        log_info "Nginx is running on port 8080"
+        break
     fi
     sleep 1
+    if [[ $i -eq 15 ]]; then
+        log_error "Nginx failed to bind to port 8080"
+        tail -20 "${LOG_DIR}/nginx_error.log"
+        exit 1
+    fi
 done
-echo "Nginx is running on port 8080"
 
-# ---------- Public URL ----------
+# ========================================
+# Generate public restream playlist
+# ========================================
 if [[ -n "$PUBLIC_DOMAIN" ]]; then
     PUBLIC_URL="${PUBLIC_DOMAIN%/}"
 else
     PUBLIC_URL="http://localhost:8080"
 fi
 
-# ---------- Generate output restream playlist ----------
-generate_output_playlist() {
-    local base_url="$1"
-    cat > "$OUTPUT_PLAYLIST" <<'HEADER'
-#EXTM3U
-HEADER
-    echo "#PLAYLIST: Kobir Shah Restream" >> "$OUTPUT_PLAYLIST"
-    echo "#GENERATED: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$OUTPUT_PLAYLIST"
-    echo "#SOURCE: ${PLAYLIST_FILE}" >> "$OUTPUT_PLAYLIST"
-    echo "" >> "$OUTPUT_PLAYLIST"
-
+log_info "Generating restream playlist..."
+{
+    echo "#EXTM3U"
+    echo "#PLAYLIST:Kobir Shah Restream"
+    echo "#GENERATED:$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    echo "#SOURCE:${PLAYLIST_FILE}"
+    echo ""
+    
     for i in "${!DISPLAY_NAMES[@]}"; do
-        local folder="${FOLDER_NAMES[$i]}"
-        local extinf="${EXTINF_LINES[$i]}"
-        local restream_url="${base_url}/${folder}/${folder}.m3u8"
-        echo "${extinf}" >> "$OUTPUT_PLAYLIST"
-        echo "${restream_url}" >> "$OUTPUT_PLAYLIST"
+        folder="${FOLDER_NAMES[$i]}"
+        echo "${EXTINF_LINES[$i]}"
+        echo "${PUBLIC_URL}/${folder}/${folder}.m3u8"
     done
-    echo "" >> "$OUTPUT_PLAYLIST"
-    echo "# ${#DISPLAY_NAMES[@]} channels" >> "$OUTPUT_PLAYLIST"
-}
+    
+    echo ""
+    echo "# Total channels: ${#DISPLAY_NAMES[@]}"
+} > "$OUTPUT_PLAYLIST"
 
-generate_output_playlist "$PUBLIC_URL"
-echo "Restream playlist generated: ${OUTPUT_PLAYLIST}"
+log_info "Restream playlist: ${OUTPUT_PLAYLIST}"
 
-# ---------- Colours ----------
-GREEN=$'\033[0;32m'
-RED=$'\033[0;31m'
-YELLOW=$'\033[1;33m'
-CYAN=$'\033[0;36m'
-MAGENTA=$'\033[0;35m'
-WHITE=$'\033[1;37m'
-BLUE=$'\033[0;34m'
-NC=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
+# ========================================
+# Terminal colors
+# ========================================
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[1;37m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' WHITE='' BOLD='' DIM='' NC=''
+fi
 
-ASCII_ART=$'\n      :::::::::  :::    ::: ::::::::: ::::::::: \n     :::    ::: :::    ::: :       : :        \n    :+:    :+:   :+:       :+:    :+: :+:        \n   +#++:++#+  +#++:++#++ +#++:++#  +#++:++#   \n  +#+    +#+ +#+    +#+ +#+    +#+ +#+         \n #+#    #+# #+#    #+# #+#    #+# #+#          \n###    ###  ########  #########  ##########    '
+# ========================================
+# Status monitor loop
+# ========================================
+log_info "Entering monitoring mode..."
+echo ""
 
-# ---------- TUI Monitor ----------
 while true; do
     clear
-    echo -e "${MAGENTA}${ASCII_ART}${NC}"
-    echo -e "${YELLOW}${BOLD}           KOBIR SHAH LIVE MULTI-CHANNEL RELAY${NC}"
-    echo -e "${CYAN}                   Developer: Kobir Shah${NC}"
-    echo -e "${WHITE}??????????????????????????????????????????????????????????????????????????????${NC}"
-    echo -e "${BOLD}Public URL:${NC}       ${GREEN}${PUBLIC_URL}${NC}"
-    echo -e "${BOLD}Restream Playlist:${NC} ${CYAN}${OUTPUT_PLAYLIST}${NC}"
+    
+    # Header
+    cat <<'EOF'
+╔═══════════════════════════════════════════════════════════════╗
+║  ██╗  ██╗██████╗ ███████╗    ██████╗ ███████╗██╗      █████╗ ║
+║  ██║  ██║██╔══██╗██╔════╝    ██╔══██╗██╔════╝██║     ██╔══██╗║
+║  ███████║██████╔╝███████╗    ██████╔╝█████╗  ██║     ███████║║
+║  ██╔══██║██╔══██╗╚════██║    ██╔══██╗██╔══╝  ██║     ██╔══██║║
+║  ██║  ██║██████╔╝███████║    ██║  ██║███████╗███████╗██║  ██║║
+║  ╚═╝  ╚═╝╚═════╝ ╚══════╝    ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝║
+╚═══════════════════════════════════════════════════════════════╝
+EOF
+    
+    echo -e "${CYAN}           KOBIR SHAH LIVE MULTI-CHANNEL RELAY${NC}"
+    echo -e "${MAGENTA}              Developer: Kobir Shah${NC}"
     echo ""
-    printf "${BOLD}%-20s %-9s %-12s %-12s %-10s %s${NC}\n" "CHANNEL" "STATUS" "SEGMENTS" "ALIVE" "AUDIO" "RESTREAM URL"
-    echo "????????????????????????????????????????????????????????????????????????????????????"
-
+    echo -e "${BOLD}Public URL:${NC}        ${GREEN}${PUBLIC_URL}${NC}"
+    echo -e "${BOLD}Restream Playlist:${NC} ${CYAN}${OUTPUT_PLAYLIST}${NC}"
+    echo -e "${BOLD}Total Channels:${NC}    ${WHITE}${#DISPLAY_NAMES[@]}${NC}"
+    echo ""
+    
+    # Table header
+    printf "${BOLD}%-25s %-10s %-8s %-10s %-10s${NC}\n" \
+        "CHANNEL" "STATUS" "SEGS" "UPDATED" "AUDIO"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # Channel status
+    active_count=0
     for i in "${!DISPLAY_NAMES[@]}"; do
         folder="${FOLDER_NAMES[$i]}"
         name="${DISPLAY_NAMES[$i]}"
         ch_dir="${HLS_ROOT}/${folder}"
         playlist="${ch_dir}/${folder}.m3u8"
-        restream_url="${PUBLIC_URL}/${folder}/${folder}.m3u8"
-        audio_lang="${CHOSEN_LANGS[$i]:-auto}"
-
-        if pgrep -f "ffmpeg.*${folder}" > /dev/null; then
-            status="${GREEN}UP${NC}"
-            seg_count=$(find "$ch_dir" -name 'segment_*.ts' 2>/dev/null | wc -l)
-            if [ -f "$playlist" ]; then
-                alive_sec=$(( $(date +%s) - $(stat -c %Y "$playlist") ))
-                alive="${alive_sec}s"
+        audio="${CHOSEN_LANGS[$i]:-Auto}"
+        
+        # Check if process is running
+        if [[ -f "${ch_dir}/.ffmpeg.pid" ]] && kill -0 $(cat "${ch_dir}/.ffmpeg.pid") 2>/dev/null; then
+            status="${GREEN}●  UP${NC}"
+            
+            seg_count=$(compgen -G "${ch_dir}/segment*.ts" | wc -l)
+            
+            if [[ -f "$playlist" ]]; then
+                age=$(($(date +%s) - $(stat -c %Y "$playlist" 2>/dev/null || echo 0)))
+                updated="${age}s ago"
             else
-                alive="starting"
+                updated="starting"
             fi
+            
+            ((active_count++))
             rm -f "${ch_dir}/.down_since"
         else
-            status="${RED}DOWN${NC}"
+            status="${RED}●  DOWN${NC}"
             seg_count="0"
-            alive="?"
-            restream_url="?"
-
+            updated="-"
+            
+            # Auto-restart logic
             if [[ ! -f "${ch_dir}/.down_since" ]]; then
                 date +%s > "${ch_dir}/.down_since"
             fi
-            down_since=$(cat "${ch_dir}/.down_since")
-            now=$(date +%s)
-            if (( now - down_since > RESTART_THRESHOLD )); then
+            
+            down_time=$(($(date +%s) - $(cat "${ch_dir}/.down_since")))
+            if (( down_time >= RESTART_THRESHOLD )); then
+                status="${YELLOW}● RESTART${NC}"
                 rm -f "${ch_dir}/.down_since"
-                start_ffmpeg "$i"
-                status="${YELLOW}RESTART${NC}"
-                alive="reconnecting"
-                restream_url="..."
+                start_ffmpeg "$i" &
             fi
         fi
-
-        audio_display=""
-        if [[ "$audio_lang" == "Bengali" ]]; then
-            audio_display="${GREEN}${audio_lang}${NC}"
-        elif [[ "$audio_lang" == "Hindi" ]]; then
-            audio_display="${BLUE}${audio_lang}${NC}"
-        else
-            audio_display="${YELLOW}${audio_lang}${NC}"
-        fi
-
-        printf "${BOLD}%-20s${NC} %b %-12s %-12s %b %s\n" "$name" "$status" "$seg_count" "$alive" "$audio_display" "$restream_url"
+        
+        # Color code audio language
+        case "$audio" in
+            Bengali) audio="${GREEN}${audio}${NC}" ;;
+            Hindi)   audio="${BLUE}${audio}${NC}" ;;
+            *)       audio="${YELLOW}${audio}${NC}" ;;
+        esac
+        
+        # Truncate long names
+        short_name=$(printf "%.23s" "$name")
+        [[ ${#name} -gt 23 ]] && short_name="${short_name}.."
+        
+        printf "%-33s %b  %-8s %-10s %b\n" \
+            "$short_name" "$status" "$seg_count" "$updated" "$audio"
     done
-
-    down_folders=()
-    for i in "${!DISPLAY_NAMES[@]}"; do
-        folder="${FOLDER_NAMES[$i]}"
-        if ! pgrep -f "ffmpeg.*${folder}" > /dev/null; then
-            down_folders+=("$folder")
-        fi
-    done
-
-    if (( ${#down_folders[@]} > 0 )); then
-        echo ""
-        echo -e "${RED}${BOLD}[!] DOWN CHANNELS -- Last errors:${NC}"
-        echo -e "${DIM}?????????????????????????????????????????????????????????${NC}"
-        for df in "${down_folders[@]:0:3}"; do
-            echo -e "${DIM}${df}:${NC}"
-            tail -2 "${LOG_DIR}/ffmpeg_${df}.log" 2>/dev/null | head -2 | while read -r err_line; do
-                echo -e "${DIM}  ${err_line}${NC}"
-            done
-        done
-        if (( ${#down_folders[@]} > 3 )); then
-            echo -e "${DIM}  ... and $(( ${#down_folders[@]} - 3 )) more${NC}"
-        fi
-    fi
-
+    
     echo ""
-    echo -e "${WHITE}??????????????????????????????????????????????????????????????????????????????${NC}"
-    if pgrep -x nginx > /dev/null; then
-        echo -e "${GREEN}[NGINX]${NC} Running on port 8080"
-    else
-        echo -e "${RED}[NGINX]${NC} NOT RUNNING!"
-    fi
-    echo -e "${GREEN}? Bengali${NC}  ${BLUE}? Hindi${NC}  ${YELLOW}? Default/Other${NC}"
-    echo -e "${YELLOW}Master Playlist:${NC}    file://${MASTER_PLAYLIST}"
-    echo -e "${YELLOW}Restream Output:${NC}   file://${OUTPUT_PLAYLIST}"
-    echo -e "${YELLOW}Local test:${NC}        curl http://localhost:8080/<folder>/<folder>.m3u8"
+    echo -e "${BOLD}Status:${NC} ${GREEN}${active_count}${NC} active / ${RED}$((${#DISPLAY_NAMES[@]} - active_count))${NC} down"
     echo ""
-    echo -e "${MAGENTA}Press Ctrl+C to stop the TUI (services keep running)${NC}"
-    sleep 3
+    
+    # Legend
+    echo -e "${GREEN}● Bengali${NC}  ${BLUE}● Hindi${NC}  ${YELLOW}● Default/Auto${NC}"
+    echo ""
+    
+    # Endpoints
+    echo -e "${DIM}Endpoints:${NC}"
+    echo -e "  ${CYAN}http://localhost:8080/master.m3u8${NC}"
+    echo -e "  ${CYAN}http://localhost:8080/restream_playlist.m3u8${NC}"
+    echo -e "  ${CYAN}http://localhost:8080/health${NC}"
+    echo ""
+    
+    echo -e "${DIM}Press Ctrl+C to stop monitoring (services continue)${NC}"
+    
+    sleep 5
 done
