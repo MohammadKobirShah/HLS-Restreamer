@@ -1,0 +1,7 @@
+# ============================================================
+# Cloudflare Tunnel — NEVER commit credentials
+# ============================================================
+tunnel/credentials.json
+tunnel/cert.pem
+*.json
+!tunnel/config.yml
