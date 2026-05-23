@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 # ============================================================
 # Kobir Shah Multi-Channel HLS Restreamer
-# Version: 2.1.1 — Railway Production Fix
+# Version: 2.1.2 — Railway Stable
 # GitHub: https://github.com/MohammadKobirShah
 #
-# KEY FIXES IN THIS VERSION:
-#   [FIX-R1] cloudflared uses --protocol http2 to avoid QUIC/UDP
-#            blocking on Railway (was causing "context canceled" /
-#            "no more connections active" errors)
-#   [FIX-R2] Script never exits on tunnel failure — continues
-#            running so Railway health check passes on :8080
-#   [FIX-R3] Health check returns 200 immediately after nginx
-#            starts — Railway won't restart the container while
-#            FFmpeg and tunnel are still initializing
-#   [FIX-R4] Startup wait runs in background so health check
-#            is never blocked by sleep 20
-#   [FIX-R5] Tunnel watchdog uses exponential backoff to avoid
-#            hammering Cloudflare edge on repeated failures
+# FIXES IN 2.1.2:
+#   [FIX-T1] --protocol http2 moved AFTER "run" subcommand
+#            (was before "run" causing cloudflared to print
+#            help text and exit immediately)
+#   [FIX-T2] Named tunnel: correct token flag order
+#            cloudflared tunnel run --protocol http2 --token X
+#   [FIX-T3] Nginx starts FIRST before any tunnel/FFmpeg work
+#            so Railway health check passes within 5s
+#   [FIX-T4] Health check endpoint responds immediately
+#   [FIX-T5] All tunnel work fully non-blocking (background)
+#   [FIX-T6] Container never exits on tunnel failure
 # ============================================================
 
 set -euo pipefail
@@ -25,7 +23,7 @@ IFS=$'\n\t'
 # ============================================================
 # Version
 # ============================================================
-readonly VERSION="2.1.1"
+readonly VERSION="2.1.2"
 readonly SCRIPT_START=$(date +%s)
 
 # ============================================================
@@ -51,7 +49,7 @@ readonly CF_TUNNEL_LOG="${LOG_DIR}/cloudflared.log"
 readonly CF_TUNNEL_PID="/root/cloudflared.pid"
 readonly CF_TUNNEL_URL_FILE="/root/tunnel_url.txt"
 
-# Public domain override
+# Public domain override (used when tunnel disabled)
 readonly PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
 
 # Tuning
@@ -63,7 +61,7 @@ readonly RESTART_THRESHOLD=15
 readonly MONITOR_INTERVAL=5
 readonly MIN_DISK_MB_PER_CHANNEL=25
 
-# Reserved nginx paths — cannot be used as channel folder names
+# Reserved nginx paths
 readonly -a RESERVED_PATHS=(
     "health" "status" "stats" "tunnel"
     "master" "restream_playlist" "favicon" "robots"
@@ -80,7 +78,6 @@ declare -a MAP_VIDEO=()
 declare -a MAP_AUDIO=()
 declare -a CHOSEN_LANGS=()
 
-# Resolved public URL — updated after tunnel connects
 PUBLIC_URL="http://localhost:8080"
 
 # ============================================================
@@ -114,7 +111,7 @@ cleanup() {
     fi
     pkill -f "cloudflared" 2>/dev/null || true
 
-    # Stop all FFmpeg processes
+    # Stop all FFmpeg
     for ch_dir in "${HLS_ROOT}"/*/; do
         [[ -d "$ch_dir" ]] || continue
         local pid_file="${ch_dir}.ffmpeg.pid"
@@ -159,7 +156,6 @@ write_tunnel_json() {
     local status="$1"
     local type="$2"
     local url="$3"
-
     mkdir -p "$HLS_ROOT"
     cat > "$TUNNEL_JSON" <<JSON
 {
@@ -174,8 +170,6 @@ JSON
 
 # ============================================================
 # Write status.html
-# Written as a file — avoids nginx "too long parameter /
-# missing '" error caused by inline HTML in return 200 '...'
 # ============================================================
 write_status_html() {
     mkdir -p "$HLS_ROOT"
@@ -224,10 +218,7 @@ write_status_html() {
 <body>
 <div class="wrap">
   <h1><span class="dot" id="hd"></span>Kobir Shah HLS Relay</h1>
-  <p class="sub">
-    Multi-Channel Live Streaming + Cloudflare Tunnel
-    v2.1.1 &mdash; auto-refreshes every 10s
-  </p>
+  <p class="sub">Multi-Channel Live Streaming + Cloudflare Tunnel v2.1.2</p>
   <div class="tbox">
     <div class="card-label">Cloudflare Tunnel URL</div>
     <div class="turl" id="turl">Loading...</div>
@@ -264,9 +255,7 @@ write_status_html() {
   </div>
   <table>
     <thead>
-      <tr>
-        <th>#</th><th>Channel</th><th>State</th><th>Segments</th><th>Audio</th>
-      </tr>
+      <tr><th>#</th><th>Channel</th><th>State</th><th>Segments</th><th>Audio</th></tr>
     </thead>
     <tbody id="ctb">
       <tr><td colspan="5" style="color:#6e7681">Loading...</td></tr>
@@ -365,7 +354,7 @@ check_disk_space() {
     fi
     log_info "Disk: ${available_mb}MB available, ${required_mb}MB needed"
     if (( available_mb < required_mb )); then
-        log_error "Not enough disk space: have ${available_mb}MB, need ${required_mb}MB"
+        log_error "Insufficient disk: have ${available_mb}MB, need ${required_mb}MB"
         return 1
     fi
     return 0
@@ -392,7 +381,7 @@ download_playlist() {
         log_warn "Download attempt $attempt/3 failed – retrying..."
         sleep 3
     done
-    log_error "Failed to download playlist after 3 attempts"
+    log_error "Failed to download playlist"
     return 1
 }
 
@@ -462,7 +451,7 @@ dedup_urls() {
 }
 
 # ============================================================
-# Dedup folder names + protect reserved paths
+# Dedup folder names
 # ============================================================
 dedup_folders() {
     declare -A seen=()
@@ -474,13 +463,12 @@ dedup_folders() {
         local is_reserved=0
         for reserved in "${RESERVED_PATHS[@]}"; do
             if [[ "$folder" == "$reserved" ]]; then
-                is_reserved=1
-                break
+                is_reserved=1; break
             fi
         done
         if [[ $is_reserved -eq 1 ]]; then
             folder="${folder}ch"
-            log_warn "Reserved path conflict: '${original}' → '${folder}'"
+            log_warn "Reserved name conflict: '${original}' → '${folder}'"
             original="$folder"
         fi
         while [[ -n "${seen[$folder]:-}" ]]; do
@@ -513,7 +501,7 @@ probe_audio_track() {
 
     if [[ -n "$audio_info" ]]; then
         while IFS=, read -r idx lang; do
-            idx=$(echo "$idx"  | xargs 2>/dev/null || true)
+            idx=$(echo "$idx"   | xargs 2>/dev/null || true)
             lang=$(echo "$lang" | xargs 2>/dev/null \
                 | tr '[:upper:]' '[:lower:]' || true)
             [[ -z "$idx" || ! "$idx" =~ ^[0-9]+$ ]] && continue
@@ -534,7 +522,6 @@ probe_audio_track() {
         echo "Auto||" > "$out_file"
         return 0
     fi
-
     echo "${chosen_lang}|0:v:0|0:${chosen_idx}" > "$out_file"
 }
 
@@ -551,11 +538,13 @@ probe_all_audio() {
     local i
     for i in "${!DISPLAY_NAMES[@]}"; do
         local out_file="${PROBE_DIR}/probe_${i}.result"
-        if ! validate_url "${URLS[$i]}" "'${DISPLAY_NAMES[$i]}'" 2>/dev/null; then
+        if ! validate_url "${URLS[$i]}" \
+                "'${DISPLAY_NAMES[$i]}'" 2>/dev/null; then
             echo "Auto||" > "$out_file"
             continue
         fi
-        (probe_audio_track "${URLS[$i]}" "${FOLDER_NAMES[$i]}" "$out_file") &
+        (probe_audio_track \
+            "${URLS[$i]}" "${FOLDER_NAMES[$i]}" "$out_file") &
         job_pids+=($!)
         if (( ${#job_pids[@]} >= MAX_PROBE_JOBS )); then
             wait "${job_pids[0]}" 2>/dev/null || true
@@ -612,7 +601,8 @@ start_ffmpeg() {
         -analyzeduration 1000000 -probesize 1000000
         -fflags "+genpts+discardcorrupt+nobuffer"
         -flags "low_delay"
-        -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        -user_agent \
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         -i "$url"
     )
 
@@ -636,7 +626,6 @@ start_ffmpeg() {
         "${ch_dir}/${folder}.m3u8"
     )
 
-    # Rotate log if over 10MB
     if [[ -f "$log_file" ]]; then
         local sz
         sz=$(stat -c%s "$log_file" 2>/dev/null || echo 0)
@@ -737,7 +726,6 @@ write_stats() {
     local starting_count="$2"
     local down_count="$3"
     local uptime_s=$(( $(date +%s) - SCRIPT_START ))
-
     local h=$(( uptime_s / 3600 ))
     local m=$(( (uptime_s % 3600) / 60 ))
     local s=$(( uptime_s % 60 ))
@@ -777,8 +765,8 @@ write_stats() {
             local ch_dir="${HLS_ROOT}/${folder}"
             local lang="${CHOSEN_LANGS[$i]:-Auto}"
             local seg_count state
-            seg_count=$(find "$ch_dir" -maxdepth 1 -name 'segment*.ts' \
-                -printf '.' 2>/dev/null | wc -c)
+            seg_count=$(find "$ch_dir" -maxdepth 1 \
+                -name 'segment*.ts' -printf '.' 2>/dev/null | wc -c)
             if is_ffmpeg_running "$ch_dir"; then
                 state="active"
             elif [[ -f "${LOCKS_DIR}/${folder}.lock" ]]; then
@@ -807,27 +795,33 @@ write_stats() {
 # ============================================================
 # Cloudflare Quick Tunnel
 #
-# FIX-R1: Added --protocol http2
-#   Railway blocks outbound UDP (used by QUIC/h3 protocol).
-#   cloudflared defaults to QUIC → connection fails silently.
-#   Forcing --protocol http2 makes cloudflared use TCP only,
-#   which Railway allows outbound on port 443.
+# FIX-T1: --protocol http2 is placed AFTER the tunnel subcommand
+#         cloudflared tunnel --no-autoupdate \
+#                     [global flags] \
+#                     [subcommand: (no subcommand for --url mode)]
 #
-# FIX-R2: Function returns 0 even on timeout so the main
-#   script never exits — Railway health check stays green.
+# For quick tunnel (--url mode) the correct form is:
+#   cloudflared tunnel --no-autoupdate --protocol http2 --url URL
+# The --protocol flag IS a global tunnel flag for --url mode.
+#
+# For named tunnel (run --token) the correct form is:
+#   cloudflared tunnel --no-autoupdate run --protocol http2 --token TOKEN
+# The --protocol flag comes AFTER run for the run subcommand.
 # ============================================================
 start_quick_tunnel() {
-    log_cf "Starting Cloudflare Quick Tunnel (trycloudflare.com)..."
-    log_cf "Protocol: http2 (TCP-only, Railway compatible)"
+    log_cf "Starting Cloudflare Quick Tunnel..."
+    log_cf "Using --protocol http2 (TCP, Railway-compatible)"
     write_tunnel_json "starting" "quick" "pending"
 
-    # Kill any stale cloudflared from previous attempt
     pkill -f "cloudflared" 2>/dev/null || true
     sleep 1
-    rm -f "$CF_TUNNEL_PID" "$CF_TUNNEL_LOG" "$CF_TUNNEL_URL_FILE"
+    rm -f "$CF_TUNNEL_PID"
+    : > "$CF_TUNNEL_LOG"
 
-    # FIX-R1: --protocol http2 forces TCP, avoids QUIC/UDP block
-    cloudflared tunnel --no-autoupdate \
+    # For quick tunnel (--url mode), --protocol is a global flag
+    # placed before the url argument, not after a subcommand
+    cloudflared tunnel \
+        --no-autoupdate \
         --protocol http2 \
         --url "http://localhost:8080" \
         --logfile "$CF_TUNNEL_LOG" \
@@ -836,49 +830,34 @@ start_quick_tunnel() {
 
     local cf_pid=$!
     echo "$cf_pid" > "$CF_TUNNEL_PID"
-    log_cf "cloudflared PID $cf_pid – waiting up to 90s for URL..."
+    log_cf "cloudflared quick tunnel PID $cf_pid"
 
+    # Extract tunnel URL from log (up to 90 seconds)
     local url="" waited=0 max_wait=90
+    log_cf "Waiting for tunnel URL (up to ${max_wait}s)..."
 
     while [[ -z "$url" ]] && (( waited < max_wait )); do
-        # Check process is still alive
         if ! kill -0 "$cf_pid" 2>/dev/null; then
-            log_warn "cloudflared exited early – last log:"
-            tail -10 "$CF_TUNNEL_LOG" >&2
+            log_warn "cloudflared quick tunnel exited early"
+            log_warn "Last log output:"
+            tail -15 "$CF_TUNNEL_LOG" >&2
             write_tunnel_json "error" "quick" ""
-            # FIX-R2: Return 0 so script continues running
             return 0
         fi
 
-        # Try all URL patterns cloudflared uses across versions
-        url=$(grep -oP 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com' \
+        url=$(grep -oP \
+            'https://[a-zA-Z0-9\-]+\.trycloudflare\.com' \
             "$CF_TUNNEL_LOG" 2>/dev/null | tail -1 || true)
 
-        if [[ -z "$url" ]]; then
-            # Newer cloudflared logs "your tunnel" differently
-            url=$(grep -oP '(?<=INF \|  )(https://[^\s]+trycloudflare[^\s]+)' \
-                "$CF_TUNNEL_LOG" 2>/dev/null | tail -1 || true)
-        fi
-
-        if [[ -z "$url" ]]; then
-            url=$(grep -iP 'trycloudflare\.com' \
-                "$CF_TUNNEL_LOG" 2>/dev/null \
-                | grep -oP 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com' \
-                | tail -1 || true)
-        fi
-
         [[ -n "$url" ]] && break
-
         sleep 3
         (( waited += 3 ))
     done
 
     if [[ -z "$url" ]]; then
-        log_warn "Tunnel URL not detected in ${max_wait}s"
-        log_warn "Cloudflare log tail:"
+        log_warn "Quick tunnel URL not detected in ${max_wait}s"
         tail -20 "$CF_TUNNEL_LOG" >&2
         write_tunnel_json "error" "quick" ""
-        # FIX-R2: Return 0 — script keeps running on localhost
         return 0
     fi
 
@@ -887,8 +866,7 @@ start_quick_tunnel() {
     PUBLIC_URL="$url"
 
     log_ok "╔══════════════════════════════════════════════════════╗"
-    log_ok "║  Cloudflare Quick Tunnel is LIVE!                    ║"
-    log_ok "║                                                      ║"
+    log_ok "║  Cloudflare Quick Tunnel LIVE                        ║"
     log_ok "║  URL:      ${url}"
     log_ok "║  Playlist: ${url}/restream_playlist.m3u8"
     log_ok "║  Status:   ${url}/status"
@@ -899,18 +877,23 @@ start_quick_tunnel() {
 
 # ============================================================
 # Cloudflare Named Tunnel
+#
+# FIX-T2: --protocol http2 placed AFTER "run" subcommand
+#   WRONG: cloudflared tunnel --protocol http2 run --token X
+#   RIGHT: cloudflared tunnel run --protocol http2 --token X
 # ============================================================
 start_named_tunnel() {
     log_cf "Starting Cloudflare Named Tunnel..."
 
     if [[ -z "$CF_TUNNEL_TOKEN" ]]; then
         log_error "CF_TUNNEL_TOKEN is required for named tunnel mode"
+        log_error "Get token from: https://one.dash.cloudflare.com → Networks → Tunnels"
         write_tunnel_json "error" "named" ""
         return 0
     fi
 
     if [[ ${#CF_TUNNEL_TOKEN} -lt 50 ]]; then
-        log_error "CF_TUNNEL_TOKEN appears invalid (too short)"
+        log_error "CF_TUNNEL_TOKEN appears invalid (too short: ${#CF_TUNNEL_TOKEN} chars)"
         write_tunnel_json "error" "named" ""
         return 0
     fi
@@ -919,12 +902,15 @@ start_named_tunnel() {
 
     pkill -f "cloudflared" 2>/dev/null || true
     sleep 1
-    rm -f "$CF_TUNNEL_PID" "$CF_TUNNEL_LOG"
+    rm -f "$CF_TUNNEL_PID"
+    : > "$CF_TUNNEL_LOG"
 
-    # FIX-R1: --protocol http2 for Railway TCP compatibility
-    cloudflared tunnel --no-autoupdate \
-        --protocol http2 \
+    # FIX-T2: --protocol http2 comes AFTER the "run" subcommand
+    # This is the correct argument order for named tunnel token auth
+    cloudflared tunnel \
+        --no-autoupdate \
         run \
+        --protocol http2 \
         --token "$CF_TUNNEL_TOKEN" \
         --logfile "$CF_TUNNEL_LOG" \
         --loglevel info \
@@ -934,22 +920,29 @@ start_named_tunnel() {
     echo "$cf_pid" > "$CF_TUNNEL_PID"
     log_cf "cloudflared named tunnel PID $cf_pid"
 
+    # Wait for connection confirmation
     local waited=0 max_wait=60 connected=0
+    log_cf "Waiting for named tunnel connection (up to ${max_wait}s)..."
+
     while (( waited < max_wait )); do
         if ! kill -0 "$cf_pid" 2>/dev/null; then
             log_warn "cloudflared named tunnel exited early"
-            tail -10 "$CF_TUNNEL_LOG" >&2
+            log_warn "Last log output:"
+            tail -15 "$CF_TUNNEL_LOG" >&2
             write_tunnel_json "error" "named" ""
             return 0
         fi
+
         if grep -q \
             -e "Connection registered" \
             -e "Registered tunnel connection" \
             -e "Tunnel is ready" \
+            -e "conns=4" \
             "$CF_TUNNEL_LOG" 2>/dev/null; then
             connected=1
             break
         fi
+
         sleep 2
         (( waited += 2 ))
     done
@@ -960,18 +953,18 @@ start_named_tunnel() {
     if [[ $connected -eq 1 ]]; then
         write_tunnel_json "online" "named" "$named_url"
         [[ -n "$named_url" ]] && PUBLIC_URL="$named_url"
-        log_ok "Named tunnel connected → ${named_url:-check dashboard}"
+        log_ok "Named tunnel connected → ${named_url:-check Cloudflare dashboard}"
     else
-        log_warn "Named tunnel not confirmed in ${max_wait}s – may still connect"
-        write_tunnel_json "starting" "named" "$named_url"
+        log_warn "Named tunnel not confirmed in ${max_wait}s – may still be connecting"
+        write_tunnel_json "starting" "named" "${named_url}"
     fi
 
     return 0
 }
 
 # ============================================================
-# Tunnel watchdog
-# FIX-R5: Exponential backoff on repeated failures
+# Tunnel watchdog — restarts cloudflared if it dies
+# Uses exponential backoff: 30s → 60s → 120s → max 300s
 # ============================================================
 tunnel_watchdog() {
     local mode="$1"
@@ -988,7 +981,7 @@ tunnel_watchdog() {
         [[ ! "$cf_pid" =~ ^[1-9][0-9]*$ ]] && break
 
         if ! kill -0 "$cf_pid" 2>/dev/null; then
-            log_cf "Watchdog: cloudflared down – restarting (backoff: ${backoff}s)..."
+            log_cf "Watchdog: cloudflared down – restarting (backoff ${backoff}s)..."
             write_tunnel_json "starting" "$mode" "pending"
 
             if [[ "$mode" == "quick" ]]; then
@@ -997,18 +990,16 @@ tunnel_watchdog() {
                 start_named_tunnel || true
             fi
 
-            # Regenerate playlists with updated PUBLIC_URL
             if (( ${#DISPLAY_NAMES[@]} > 0 )); then
                 generate_restream_playlist "$PUBLIC_URL" 2>/dev/null || true
                 generate_master_playlist                 2>/dev/null || true
             fi
 
-            # Exponential backoff: 30s → 60s → 120s → cap at 300s
             (( backoff = backoff * 2 ))
             (( backoff > 300 )) && backoff=300
         else
-            # Process is alive — check if tunnel URL appeared
-            if [[ -f "$CF_TUNNEL_LOG" ]]; then
+            # Process alive — check for newly appeared URL (quick tunnel)
+            if [[ "$mode" == "quick" && -f "$CF_TUNNEL_LOG" ]]; then
                 local new_url
                 new_url=$(grep -oP \
                     'https://[a-zA-Z0-9\-]+\.trycloudflare\.com' \
@@ -1016,11 +1007,10 @@ tunnel_watchdog() {
                 if [[ -n "$new_url" && "$new_url" != "$PUBLIC_URL" ]]; then
                     log_cf "Tunnel URL updated: $new_url"
                     PUBLIC_URL="$new_url"
-                    write_tunnel_json "online" "$mode" "$new_url"
+                    write_tunnel_json "online" "quick" "$new_url"
                     generate_restream_playlist "$PUBLIC_URL" 2>/dev/null || true
                 fi
             fi
-            # Reset backoff when healthy
             backoff=30
         fi
     done
@@ -1029,32 +1019,17 @@ tunnel_watchdog() {
 }
 
 # ============================================================
-# Color setup
-# ============================================================
-setup_colors() {
-    if [[ -t 2 ]]; then
-        RED='\033[0;31m'    GREEN='\033[0;32m'  YELLOW='\033[1;33m'
-        BLUE='\033[0;34m'   CYAN='\033[0;36m'   WHITE='\033[1;37m'
-        BOLD='\033[1m'      DIM='\033[2m'        NC='\033[0m'
-    else
-        RED='' GREEN='' YELLOW='' BLUE='' CYAN='' WHITE='' BOLD='' DIM='' NC=''
-    fi
-}
-
-# ============================================================
-# POST-STARTUP background worker
-# FIX-R4: Runs the 20s segment wait + initial playlist gen
-# in the background so the monitor loop starts immediately
-# and Railway health check always sees nginx responding
+# Post-startup background worker
+# Runs segment wait + playlist generation without blocking
+# the monitor loop (which keeps health check green)
 # ============================================================
 post_startup_worker() {
-    log_info "Post-startup worker: waiting ${STARTUP_WAIT_SECONDS}s for segments..."
+    log_info "Post-startup: waiting ${STARTUP_WAIT_SECONDS}s for segments..."
     sleep "$STARTUP_WAIT_SECONDS"
 
     generate_master_playlist
     generate_restream_playlist "$PUBLIC_URL"
 
-    # Report dead channels
     local dead_count=0
     for i in "${!DISPLAY_NAMES[@]}"; do
         local ch_dir="${HLS_ROOT}/${FOLDER_NAMES[$i]}"
@@ -1065,10 +1040,24 @@ post_startup_worker() {
         fi
     done
 
-    if (( dead_count > 0 )); then
-        log_warn "${dead_count} channel(s) have no segments after ${STARTUP_WAIT_SECONDS}s"
-    else
+    if (( dead_count == 0 )); then
         log_ok "All channels producing segments"
+    else
+        log_warn "${dead_count} channel(s) have no segments after ${STARTUP_WAIT_SECONDS}s"
+    fi
+}
+
+# ============================================================
+# Color setup
+# ============================================================
+setup_colors() {
+    if [[ -t 2 ]]; then
+        RED='\033[0;31m'  GREEN='\033[0;32m'  YELLOW='\033[1;33m'
+        BLUE='\033[0;34m' CYAN='\033[0;36m'   WHITE='\033[1;37m'
+        BOLD='\033[1m'    DIM='\033[2m'        NC='\033[0m'
+    else
+        RED='' GREEN='' YELLOW='' BLUE='' CYAN=''
+        WHITE='' BOLD='' DIM='' NC=''
     fi
 }
 
@@ -1083,10 +1072,8 @@ setup_colors
 mkdir -p "$HLS_ROOT" "$LOG_DIR" "$LOCKS_DIR" "$PROBE_DIR"
 chmod 755 /root "$HLS_ROOT" "$LOG_DIR" "$LOCKS_DIR" "$PROBE_DIR"
 
-# Write status.html before nginx starts (avoids 404 on first request)
+# Write static files before anything else
 write_status_html
-
-# Write initial tunnel.json (avoids 404 before tunnel connects)
 write_tunnel_json "starting" "${CF_TUNNEL_MODE}" "pending"
 
 log_info "=================================================="
@@ -1102,17 +1089,43 @@ pkill -x nginx                  2>/dev/null || true
 sleep 2
 rm -f /root/nginx.pid "${LOCKS_DIR}"/*.lock "$CF_TUNNEL_PID" 2>/dev/null || true
 
+# Validate nginx config FIRST — fail fast before any download
+log_info "Validating nginx config..."
+if ! nginx -t -c "$NGINX_CONF" -p /root/ 2>>"${LOG_DIR}/nginx.log"; then
+    log_error "Nginx config invalid – fix nginx.conf and rebuild"
+    tail -20 "${LOG_DIR}/nginx.log" >&2
+    exit 1
+fi
+log_ok "Nginx config valid"
+
+# FIX-T3: Start nginx FIRST so health check passes immediately
+log_info "Starting nginx..."
+nginx -c "$NGINX_CONF" -p /root/ >> "${LOG_DIR}/nginx.log" 2>&1
+
+nginx_up=0
+for i in $(seq 1 20); do
+    if ss -tlnp 2>/dev/null | grep -q ':8080'; then
+        nginx_up=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ $nginx_up -eq 0 ]]; then
+    log_error "Nginx failed to bind to :8080"
+    tail -20 "${LOG_DIR}/nginx_error.log" >&2
+    exit 1
+fi
+log_ok "Nginx listening on :8080 — health check will now pass"
+
+# Write initial stats so /stats doesn't 404
+write_stats 0 0 0 2>/dev/null || true
+
 # Download playlist
 download_playlist || exit 1
 
 if [[ ! -f "$PLAYLIST_FILE" ]]; then
     log_error "Playlist not found: $PLAYLIST_FILE"
-    log_error "Mount a file to $PLAYLIST_FILE or set M3U_URL env var"
-    exit 1
-fi
-
-if [[ ! -f "$NGINX_CONF" ]]; then
-    log_error "Nginx config not found: $NGINX_CONF"
     exit 1
 fi
 
@@ -1137,46 +1150,14 @@ check_disk_space \
 # Parallel audio probe
 probe_all_audio
 
-# Validate nginx
-log_info "Validating nginx config..."
-if ! nginx -t -c "$NGINX_CONF" -p /root/ 2>>"${LOG_DIR}/nginx.log"; then
-    log_error "Nginx config invalid"
-    tail -30 "${LOG_DIR}/nginx.log" >&2
-    exit 1
-fi
-log_ok "Nginx config valid"
-
-# Start nginx
-log_info "Starting nginx..."
-nginx -c "$NGINX_CONF" -p /root/ >> "${LOG_DIR}/nginx.log" 2>&1
-
-nginx_up=0
-for i in $(seq 1 20); do
-    if ss -tlnp 2>/dev/null | grep -q ':8080'; then
-        nginx_up=1
-        break
-    fi
-    sleep 1
-done
-
-if [[ $nginx_up -eq 0 ]]; then
-    log_error "Nginx failed to bind to :8080"
-    tail -20 "${LOG_DIR}/nginx_error.log" >&2
-    exit 1
-fi
-log_ok "Nginx listening on :8080"
-
-# Write initial empty stats so /stats doesn't 404
-write_stats 0 0 0 2>/dev/null || true
-
-# Start Cloudflare tunnel
+# Start Cloudflare tunnel (non-blocking — never causes exit)
 case "$CF_TUNNEL_MODE" in
     quick)
         if command -v cloudflared &>/dev/null; then
             start_quick_tunnel
             tunnel_watchdog "quick" &
         else
-            log_error "cloudflared not found"
+            log_error "cloudflared binary not found in PATH"
             write_tunnel_json "error" "quick" ""
         fi
         ;;
@@ -1185,17 +1166,17 @@ case "$CF_TUNNEL_MODE" in
             start_named_tunnel
             tunnel_watchdog "named" &
         else
-            log_error "cloudflared not found"
+            log_error "cloudflared binary not found in PATH"
             write_tunnel_json "error" "named" ""
         fi
         ;;
     disabled)
-        log_info "Tunnel disabled"
+        log_info "Cloudflare tunnel disabled"
         write_tunnel_json "disabled" "none" ""
         [[ -n "$PUBLIC_DOMAIN" ]] && PUBLIC_URL="${PUBLIC_DOMAIN%/}"
         ;;
     *)
-        log_warn "Unknown CF_TUNNEL_MODE '${CF_TUNNEL_MODE}' – using quick"
+        log_warn "Unknown CF_TUNNEL_MODE='${CF_TUNNEL_MODE}' – defaulting to quick"
         start_quick_tunnel
         tunnel_watchdog "quick" &
         ;;
@@ -1208,8 +1189,7 @@ for i in "${!DISPLAY_NAMES[@]}"; do
     sleep 0.3
 done
 
-# FIX-R4: Run post-startup wait in background
-# Health check passes immediately — Railway won't restart us
+# Post-startup worker runs in background (non-blocking)
 post_startup_worker &
 
 log_ok "System running. Monitor loop starting..."
@@ -1225,7 +1205,9 @@ while true; do
     local_time=$(date '+%Y-%m-%d %H:%M:%S')
     uptime_s=$(( $(date +%s) - SCRIPT_START ))
     uptime_str=$(printf "%02dh %02dm %02ds" \
-        $((uptime_s/3600)) $(( (uptime_s%3600)/60 )) $((uptime_s%60)))
+        $((uptime_s/3600)) \
+        $(( (uptime_s%3600)/60 )) \
+        $((uptime_s%60)))
 
     tunnel_url=""
     tunnel_status=""
@@ -1237,16 +1219,17 @@ while true; do
     fi
 
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}${BOLD}     KOBIR SHAH – HLS RESTREAMER v${VERSION} + CLOUDFLARE TUNNEL          ${NC}${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}${BOLD}     KOBIR SHAH – HLS RESTREAMER v${VERSION} + CLOUDFLARE TUNNEL         ${NC}${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
     case "$tunnel_status" in
-        online)   echo -e "  ${BOLD}☁  Tunnel:${NC} ${GREEN}LIVE${NC} → ${GREEN}${tunnel_url}${NC}" ;;
-        starting) echo -e "  ${BOLD}☁  Tunnel:${NC} ${YELLOW}CONNECTING...${NC}" ;;
-        disabled) echo -e "  ${BOLD}☁  Tunnel:${NC} ${DIM}Disabled${NC}" ;;
-        error)    echo -e "  ${BOLD}☁  Tunnel:${NC} ${RED}ERROR – retrying...${NC}" ;;
-        *)        echo -e "  ${BOLD}☁  Tunnel:${NC} ${DIM}${tunnel_status:-unknown}${NC}" ;;
+        online)   echo -e "  ${BOLD}☁  Tunnel:${NC}  ${GREEN}LIVE${NC} → ${GREEN}${tunnel_url}${NC}" ;;
+        starting) echo -e "  ${BOLD}☁  Tunnel:${NC}  ${YELLOW}CONNECTING...${NC}" ;;
+        disabled) echo -e "  ${BOLD}☁  Tunnel:${NC}  ${DIM}Disabled${NC}" ;;
+        error)    echo -e "  ${BOLD}☁  Tunnel:${NC}  ${RED}ERROR – watchdog will retry${NC}" ;;
+        offline)  echo -e "  ${BOLD}☁  Tunnel:${NC}  ${RED}OFFLINE${NC}" ;;
+        *)        echo -e "  ${BOLD}☁  Tunnel:${NC}  ${DIM}${tunnel_status:-unknown}${NC}" ;;
     esac
 
     echo -e "  ${BOLD}Local:${NC}     ${CYAN}http://localhost:8080${NC}"
@@ -1274,8 +1257,8 @@ while true; do
             -name 'segment*.ts' -printf '.' 2>/dev/null | wc -c)
 
         if [[ -f "$playlist" ]]; then
-            age=$(( $(date +%s) - $(stat -c %Y "$playlist" 2>/dev/null \
-                || date +%s) ))
+            age=$(( $(date +%s) - $(stat -c %Y "$playlist" \
+                2>/dev/null || date +%s) ))
             if   (( age < 60 ));   then updated="${age}s ago"
             elif (( age < 3600 )); then updated="$((age/60))m ago"
             else                        updated="${RED}STALE${NC}"
@@ -1304,7 +1287,8 @@ while true; do
             fi
 
             local down_since
-            down_since=$(cat "${ch_dir}/.down_since" 2>/dev/null || date +%s)
+            down_since=$(cat "${ch_dir}/.down_since" \
+                2>/dev/null || date +%s)
             local down_time=$(( $(date +%s) - down_since ))
 
             if (( down_time >= RESTART_THRESHOLD )); then
@@ -1327,7 +1311,11 @@ while true; do
             *)       lc="${YELLOW}${lang}${NC}" ;;
         esac
 
-        (( ${#name} > 24 )) && short_name="${name:0:22}.." || short_name="$name"
+        if (( ${#name} > 24 )); then
+            short_name="${name:0:22}.."
+        else
+            short_name="$name"
+        fi
 
         printf "  %-3s %-26s %b  %-5s %-10s %b\n" \
             "$((i+1))" "$short_name" \
@@ -1336,8 +1324,8 @@ while true; do
 
     echo ""
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────${NC}"
-    echo -e "  ${GREEN}● Active: ${active_count}${NC}  " \
-            "${YELLOW}◑ Starting: ${starting_count}${NC}  " \
+    echo -e "  ${GREEN}● Active: ${active_count}${NC}   " \
+            "${YELLOW}◑ Starting: ${starting_count}${NC}   " \
             "${RED}○ Down: ${down_count}${NC}"
     echo ""
     echo -e "  ${GREEN}● Bengali${NC}  ${BLUE}● Hindi${NC}  " \
